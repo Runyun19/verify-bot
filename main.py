@@ -1,45 +1,66 @@
-import os, discord
+import os, re, csv, discord
+from pathlib import Path
 
 # ── ENV / IDs ────────────────────────────────────────────────────────────────
 TOKEN = os.getenv("DISCORD_TOKEN")
-REGISTER_CHANNEL_ID = int(os.getenv("REGISTER_CHANNEL_ID", "1407288165466898452"))  # #register
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "1406985699156037734"))            # #player-id-log
-VERIFIED_ROLE_ID = int(os.getenv("VERIFIED_ROLE_ID", "1407289000300908735"))
 
-# (opsiyonel) Community Managers iletişim bilgisi:
-CM_ROLE_ID = int(os.getenv("CM_ROLE_ID", "0"))             # örn. @Community Managers rol ID
-SUPPORT_USER_ID = os.getenv("SUPPORT_USER_ID", "0")        # tek bir yetkili kullanıcı ID (string)
+REGISTER_CHANNEL_ID = 1407288165466898452   # #special-reward
+LOG_CHANNEL_ID = 1406985699156037734        # #player-id-log
 
 # ── RULES ────────────────────────────────────────────────────────────────────
 EXACT_DIGITS = 9  # Player ID must be exactly 9 digits
 
-# ── TEXTS (EN) ───────────────────────────────────────────────────────────────
+# ── TEXTS (English only) ─────────────────────────────────────────────────────
 BRAND = "Raid Rush"
 CHANNEL_MENTION = f"<#{REGISTER_CHANNEL_ID}>"
 COLOR_OK = 0x57F287
 
-def cm_contact():
-    if SUPPORT_USER_ID and SUPPORT_USER_ID.isdigit() and SUPPORT_USER_ID != "0":
-        return f"<@{SUPPORT_USER_ID}>"
-    if CM_ROLE_ID:
-        return f"<@&{CM_ROLE_ID}>"
-    return "the Community Managers"
+EMAIL_RE = re.compile(r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.I)
 
-HINT_NONDIGIT = (
-    "{mention} Only numbers are allowed. Please send **just your Player ID** in {ch}. "
-    "Example: `123456789`"
+HINT_FORMAT = (
+    "{mention} Please send your **email and Player ID** in one message separated by space.\n"
+    "Example: `email@example.com 123456789`"
 )
-HINT_EXACT = (
-    "{mention} Your Player ID must be **exactly {n} digits**. "
-    "Send only numbers in {ch}. Example: `123456789`"
-)
-DM_OK = "✅ Player ID saved and your access has been granted. Enjoy!"
+HINT_INVALID_EMAIL = "{mention} Invalid email format. Please try again.\n" + HINT_FORMAT
+HINT_INVALID_DIGITS = "{mention} Player ID must contain only digits. Please try again."
+HINT_INVALID_LENGTH = "{mention} Player ID must be exactly {n} digits. Please try again."
+HINT_ALREADY_SUBMITTED = "{mention} You have **already submitted** your information. Updates are disabled."
+DM_OK = "✅ Your information has been saved. Your code will be sent by email."
+
+# ── PERSISTENCE (CSV) ────────────────────────────────────────────────────────
+SAVE_PATH = Path("submissions.csv")
+
+def load_submitted_user_ids() -> set[int]:
+    ids = set()
+    if SAVE_PATH.exists():
+        try:
+            with SAVE_PATH.open("r", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    # Expecting columns: discord_user_id,email,player_id
+                    uid_str = row.get("discord_user_id")
+                    if uid_str and uid_str.isdigit():
+                        ids.add(int(uid_str))
+        except Exception:
+            pass
+    return ids
+
+def append_submission(discord_user_id: int, email: str, player_id: str):
+    file_exists = SAVE_PATH.exists()
+    with SAVE_PATH.open("a", newline="") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["discord_user_id", "email", "player_id"])
+        writer.writerow([discord_user_id, email, player_id])
 
 # ── BOT ──────────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 client = discord.Client(intents=intents)
+
+# In-memory cache of users who already submitted (also prefilled from CSV)
+submitted_users = set()
 
 async def send_temp(channel: discord.TextChannel, text: str):
     try:
@@ -49,14 +70,17 @@ async def send_temp(channel: discord.TextChannel, text: str):
 
 @client.event
 async def on_ready():
+    global submitted_users
+    submitted_users = load_submitted_user_ids()
     print(f"✅ Login successful: {client.user} (EXACT_DIGITS={EXACT_DIGITS})")
+    print(f"Loaded {len(submitted_users)} submitted user(s) from CSV.")
 
 @client.event
 async def on_message(message: discord.Message):
     # Ignore bots/DMs
     if message.author.bot or not message.guild:
         return
-    # Only listen in registration channel
+    # Only listen in the registration channel
     if message.channel.id != REGISTER_CHANNEL_ID:
         return
 
@@ -68,62 +92,71 @@ async def on_message(message: discord.Message):
     except:
         pass
 
-    guild = message.guild
-    verified_role = guild.get_role(VERIFIED_ROLE_ID)
-    is_verified = verified_role in message.author.roles if verified_role else False
-    log_ch = guild.get_channel(LOG_CHANNEL_ID)
+    log_ch = message.guild.get_channel(LOG_CHANNEL_ID)
     uid = message.author.id
 
-    # ── ONE-TIME REGISTRATION: block updates ─────────────────────────────────
-    if is_verified:
-        text = (
-            f"{message.author.mention} You are **already verified**. "
-            f"Updates are disabled. Please DM {cm_contact()} to request a change."
-        )
-        await send_temp(message.channel, text)
-        # (opsiyonel) log the attempt
+    # One-time submission check
+    if uid in submitted_users:
+        await send_temp(message.channel, HINT_ALREADY_SUBMITTED.format(mention=message.author.mention))
         if log_ch:
             try:
-                await log_ch.send(f"⛔ Update attempt blocked for <@{uid}>. Typed `{content}`")
+                await log_ch.send(f"⛔ Duplicate submission attempt by <@{uid}>. Typed `{content}`")
             except:
                 pass
         return
 
-    # ── VALIDATION (exactly 9 digits) ────────────────────────────────────────
-    if not content.isdigit():
-        await send_temp(message.channel, HINT_NONDIGIT.format(mention=message.author.mention, ch=CHANNEL_MENTION))
+    # Parse input: "email@example.com 123456789"
+    parts = content.replace("\n", " ").split()
+    if len(parts) != 2:
+        await send_temp(message.channel, HINT_FORMAT.format(mention=message.author.mention))
         return
-    if len(content) != EXACT_DIGITS:
+
+    email, player_id = parts[0].strip(), parts[1].strip()
+
+    # Validate
+    if not EMAIL_RE.fullmatch(email):
+        await send_temp(message.channel, HINT_INVALID_EMAIL.format(mention=message.author.mention))
+        return
+
+    if not player_id.isdigit():
+        await send_temp(message.channel, HINT_INVALID_DIGITS.format(mention=message.author.mention))
+        return
+
+    if len(player_id) != EXACT_DIGITS:
         await send_temp(
             message.channel,
-            HINT_EXACT.format(mention=message.author.mention, ch=CHANNEL_MENTION, n=EXACT_DIGITS)
+            HINT_INVALID_LENGTH.format(mention=message.author.mention, n=EXACT_DIGITS)
         )
         return
 
-    player_id = content  # valid
+    # Mark as submitted (memory + CSV)
+    submitted_users.add(uid)
+    try:
+        append_submission(uid, email, player_id)
+    except Exception as e:
+        # Failing to write CSV shouldn't block the flow; still proceed
+        if log_ch:
+            await log_ch.send(f"⚠️ CSV write error for <@{uid}>: `{e}`")
 
-    # ── LOG (plain text with @mention so it always tags) ─────────────────────
+    # Log valid submission (private channel)
     if log_ch:
         try:
-            await log_ch.send(f"<@{uid}> player id `{player_id}`")
+            emb = discord.Embed(title="New Submission", color=0x3498DB)
+            emb.add_field(name="Discord", value=f"{message.author} (`{uid}`)", inline=False)
+            emb.add_field(name="Email", value=email, inline=True)
+            emb.add_field(name="Player ID", value=player_id, inline=True)
+            await log_ch.send(embed=emb)
         except:
-            pass
+            await log_ch.send(f"<@{uid}> email `{email}` | player id `{player_id}`")
 
-    # ── ROLE (assign now) ────────────────────────────────────────────────────
-    try:
-        if verified_role:
-            await message.author.add_roles(verified_role, reason="Player ID verified")
-    except Exception as e:
-        if log_ch:
-            await log_ch.send(f"⚠️ Could not assign role to <@{uid}>: `{e}`")
-
-    # ── DM confirm ───────────────────────────────────────────────────────────
+    # DM confirmation (English only)
     try:
         emb_ok = discord.Embed(description=DM_OK, color=COLOR_OK)
         emb_ok.set_author(name=f"{BRAND} Verify")
+        emb_ok.add_field(name="Email", value=email, inline=True)
         emb_ok.add_field(name="Player ID", value=f"`{player_id}`", inline=True)
         await message.author.send(embed=emb_ok)
     except:
-        await send_temp(message.channel, f"{message.author.mention} Verified. Welcome!")
+        await send_temp(message.channel, f"{message.author.mention} Saved successfully.")
 
 client.run(TOKEN)
